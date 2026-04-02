@@ -1,0 +1,7 @@
+.env
+bot_state.json
+*.png
+*.lnk
+*.bat
+__pycache__/
+*.pyc
