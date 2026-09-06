@@ -1,5 +1,8 @@
 .env
 bot_state.json
+schedule_cache.json
+schedule_cache.json.tmp
+bot.instance.lock
 *.png
 *.lnk
 *.bat

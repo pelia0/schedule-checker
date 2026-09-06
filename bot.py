@@ -13,13 +13,14 @@ Schedule Checker Bot — Телеграм-бот для моніторингу �
 """
 
 import time
+import sys
 import re
 import schedule
 import requests
 import os
 import json
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from io import StringIO
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -38,11 +39,11 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')       # Токен Телеграм
 CHANNEL_ID = os.getenv('CHANNEL_ID')               # ID Телеграм-групи/каналу
 SCHEDULE_URL = os.getenv('SCHEDULE_URL')            # Посилання на таблицю розкладу
 BIRTHDAY_SHEET_URL = os.getenv('BIRTHDAY_SHEET_URL')  # Посилання на таблицю днів народження
-SCHEDULE_CHECK_TIME = os.getenv('SCHEDULE_CHECK_TIME', '20:00')  # Час перевірки розкладу
-BIRTHDAY_CHECK_TIME = os.getenv('BIRTHDAY_CHECK_TIME', '08:30')  # Час перевірки ДН
+SCHEDULE_CHECK_TIME = os.getenv('SCHEDULE_CHECK_TIME', '17:00')  # Час перевірки розкладу
+BIRTHDAY_CHECK_TIME = os.getenv('BIRTHDAY_CHECK_TIME', '08:00')  # Час перевірки ДН
 
 # Назва групи для пошуку (наприклад: "Т-22", "А-31", "КІ-15")
-SCHEDULE_GROUP = os.getenv('SCHEDULE_GROUP', 'Т-22')
+SCHEDULE_GROUP = os.getenv('SCHEDULE_GROUP', 'T-32')
 
 # Файл для збереження стану бота (що вже перевірено, кого привітано)
 STATE_FILE = "bot_state.json"
@@ -65,7 +66,12 @@ LATIN_TO_CYRILLIC = {v: k for k, v in CYRILLIC_TO_LATIN.items()}
 
 def log(message):
     """Виводить повідомлення з поточним часом у консоль."""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+    rendered = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
+    try:
+        print(rendered)
+    except UnicodeEncodeError:
+        encoding = getattr(getattr(sys, "stdout", None), "encoding", None) or "utf-8"
+        print(rendered.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 # =============================================================================
@@ -153,7 +159,7 @@ def print_startup_status():
 
     df = get_birthday_data()
     if not df.empty:
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today = _kyiv_now().replace(hour=0, minute=0, second=0, microsecond=0)
         upcoming = []
         for index, row in df.iterrows():
             try:
@@ -184,28 +190,36 @@ def print_startup_status():
 #  ВІДПРАВКА ПОВІДОМЛЕНЬ У ТЕЛЕГРАМ
 # =============================================================================
 
-def send_message(text):
-    """Відправляє текстове повідомлення в Телеграм-групу."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    target_ids = [CHANNEL_ID, f"-100{CHANNEL_ID.replace('-', '')}"]
-    for tid in target_ids:
-        try:
-            requests.post(url, json={'chat_id': tid, 'text': text})
-        except Exception:
-            pass
+def _legacy_send_message(text):
+    """Legacy wrapper: send to the configured group exactly once."""
+    if not TELEGRAM_TOKEN or not CHANNEL_ID:
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHANNEL_ID, "text": text},
+            timeout=25,
+        )
+        return response.ok
+    except Exception:
+        return False
 
 
-def send_photo(photo_path, caption):
-    """Відправляє фото (скріншот розкладу) з підписом у Телеграм-групу."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    target_ids = [CHANNEL_ID, f"-100{CHANNEL_ID.replace('-', '')}"]
-    for tid in target_ids:
-        try:
-            with open(photo_path, 'rb') as photo:
-                requests.post(url, data={'chat_id': tid, 'caption': caption, 'parse_mode': 'Markdown'},
-                             files={'photo': photo})
-        except Exception:
-            pass
+def _legacy_send_photo(photo_path, caption):
+    """Legacy wrapper: send a photo to the configured group exactly once."""
+    if not TELEGRAM_TOKEN or not CHANNEL_ID:
+        return False
+    try:
+        with open(photo_path, "rb") as photo:
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                data={"chat_id": CHANNEL_ID, "caption": caption, "parse_mode": "Markdown"},
+                files={"photo": photo},
+                timeout=30,
+            )
+        return response.ok
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -327,7 +341,7 @@ def find_group_in_text(text):
 #  ПЕРЕВІРКА РОЗКЛАДУ (основна функція)
 # =============================================================================
 
-def check_schedule(force=False):
+def _legacy_check_schedule(force=False):
     """
     Перевіряє розклад на наявність групи.
 
@@ -415,7 +429,7 @@ def check_schedule(force=False):
 #  ПЕРЕВІРКА ПРОПУЩЕНИХ ЗАВДАНЬ (при запуску бота)
 # =============================================================================
 
-def run_missed_tasks():
+def _legacy_run_missed_tasks():
     """
     Перевіряє, чи не пропущені завдання за сьогодні.
 
@@ -463,7 +477,7 @@ def process_birthdays():
         log("❌ Таблиця ДН пуста або недоступна.")
         return
 
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = _kyiv_now().replace(hour=0, minute=0, second=0, microsecond=0)
     current_year = today.year
     state = load_state()
 
@@ -505,8 +519,10 @@ def process_birthdays():
                            f"відсвяткував(ла) {name} {surname}! 🥳\n\nВітаємо!")
                     log(f"🐢 ПРОПУЩЕНИЙ ДН: {name} {surname}. Відправляю з вибаченням.")
 
-                send_message(msg)
-                mark_birthday_greeted(unique_key)
+                if send_message(msg):
+                    mark_birthday_greeted(unique_key)
+                else:
+                    log(f"⚠️ Вітання для {name} {surname} не підтверджено Telegram; повторимо пізніше.")
 
         except Exception:
             continue
@@ -517,16 +533,269 @@ def process_birthdays():
 #  ТОЧКА ВХОДУ — ЗАПУСК БОТА
 # =============================================================================
 
+from schedule_announcements import build_daily_announcement, ScheduleDataError
+
+
+def _kyiv_now():
+    try:
+        from zoneinfo import ZoneInfo
+        try:
+            return datetime.now(ZoneInfo("Europe/Kyiv"))
+        except Exception:
+            return datetime.now(ZoneInfo("Europe/Kiev"))
+    except Exception:
+        return datetime.now()
+
+
+def _time_reached(now, value):
+    try:
+        hour, minute = (int(part) for part in value.strip().split(":", 1))
+        return (now.hour, now.minute) >= (hour, minute)
+    except (AttributeError, TypeError, ValueError):
+        log(f"⚠️ Некоректний час у конфігурації: {value!r}")
+        return False
+
+
+def _next_school_day(day):
+    candidate = day + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def send_message(text, chat_id=None, parse_mode=None):
+    """Send exactly one Telegram message to the requested chat."""
+    target = str(chat_id if chat_id is not None else CHANNEL_ID or "").strip()
+    if not target:
+        log("❌ Не задано Telegram chat_id; повідомлення не відправлено.")
+        return False
+    if not TELEGRAM_TOKEN:
+        log("❌ Не задано TELEGRAM_TOKEN; повідомлення не відправлено.")
+        return False
+
+    payload = {"chat_id": target, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json=payload,
+            timeout=25,
+        )
+        data = response.json()
+        if response.ok and data.get("ok"):
+            log(f"✅ Повідомлення відправлено в Telegram chat_id={target}.")
+            return True
+        log(f"❌ Telegram не прийняв повідомлення: {data.get('description', response.status_code)}")
+    except Exception as exc:
+        log(f"❌ Помилка відправки повідомлення в Telegram: {exc}")
+    return False
+
+
+def send_photo(photo_path, caption, chat_id=None):
+    """Compatibility helper that also sends to exactly one target."""
+    target = str(chat_id if chat_id is not None else CHANNEL_ID or "").strip()
+    if not target or not TELEGRAM_TOKEN:
+        log("❌ Не задано Telegram target/token; фото не відправлено.")
+        return False
+    try:
+        with open(photo_path, "rb") as photo:
+            response = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                data={"chat_id": target, "caption": caption, "parse_mode": "Markdown"},
+                files={"photo": photo},
+                timeout=30,
+            )
+        data = response.json()
+        if response.ok and data.get("ok"):
+            return True
+        log(f"❌ Telegram не прийняв фото: {data.get('description', response.status_code)}")
+    except Exception as exc:
+        log(f"❌ Помилка відправки фото в Telegram: {exc}")
+    return False
+
+
+def check_schedule(force=False, target_chat_id=None, dry_run=False, target_day=None):
+    """Build and send the data-driven daily schedule announcement."""
+    now = _kyiv_now()
+    target_day = target_day or _next_school_day(now.date())
+    if not force and now.weekday() >= 5:
+        log("🛌 Вихідний: анонс розкладу не потрібен.")
+        return False
+
+    state = load_state()
+    today_str = target_day.isoformat()
+    if not force and (
+        state.get("last_schedule_announcement") == today_str
+        or state.get("last_schedule_check") == today_str
+    ):
+        log("✅ Анонс розкладу за сьогодні вже відправлено. Пропускаю.")
+        return False
+
+    try:
+        message, diagnostics = build_daily_announcement(target_day)
+    except ScheduleDataError as exc:
+        log(f"❌ Не вдалося побудувати анонс розкладу: {exc}")
+        return False
+    except Exception as exc:
+        log(f"❌ Непередбачена помилка побудови розкладу: {exc}")
+        return False
+
+    if dry_run:
+        try:
+            print(message)
+            print("\n[diagnostics]", diagnostics)
+        except UnicodeEncodeError:
+            encoding = getattr(getattr(sys, "stdout", None), "encoding", None) or "utf-8"
+            rendered = message + "\n\n[diagnostics] " + repr(diagnostics)
+            print(rendered.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        return True
+
+    target = target_chat_id if target_chat_id is not None else CHANNEL_ID
+    if not send_message(message, chat_id=target, parse_mode="HTML"):
+        return False
+
+    # A private test must never mark the group announcement as complete.
+    if target_chat_id is None:
+        state = load_state()
+        state["last_schedule_announcement"] = today_str
+        state["last_schedule_check"] = today_str
+        save_state(state)
+        log("💾 Анонс розкладу позначено виконаним на сьогодні.")
+    return True
+
+
+def run_missed_tasks():
+    """Run only the jobs whose Kyiv-time schedule has already passed."""
+    now = _kyiv_now()
+    log("🔄 Перевіряю пропущені завдання...")
+    state = load_state()
+    schedule_day = _next_school_day(now.date())
+    schedule_day_str = schedule_day.isoformat()
+
+    if _time_reached(now, SCHEDULE_CHECK_TIME):
+        if state.get("last_schedule_announcement") != schedule_day_str and state.get("last_schedule_check") != schedule_day_str:
+            check_schedule(force=False)
+        else:
+            log("✅ Розклад на сьогодні вже був відправлений.")
+    else:
+        log(f"🕒 Для розкладу ще рано; час запуску {SCHEDULE_CHECK_TIME}.")
+
+    if _time_reached(now, BIRTHDAY_CHECK_TIME):
+        process_birthdays()
+    else:
+        log(f"🕒 Для привітань ще рано; час запуску {BIRTHDAY_CHECK_TIME}.")
+
+
+def _resolve_private_test_target(username=None):
+    """Resolve @username to a private chat id from updates, never to CHANNEL_ID."""
+    explicit = (os.getenv("PRIVATE_TEST_CHAT_ID") or "").strip()
+    candidate = (username or explicit or os.getenv("PRIVATE_TEST_USERNAME") or "@pelia0").strip()
+    if candidate and not candidate.startswith("@"):
+        if not candidate.isdigit():
+            raise RuntimeError("PRIVATE_TEST_CHAT_ID має бути додатним числовим private chat_id")
+        return candidate
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("для приватного тесту потрібен TELEGRAM_TOKEN")
+
+    wanted = candidate.lstrip("@").casefold()
+    response = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+        params={"limit": 100},
+        timeout=20,
+    )
+    data = response.json()
+    if not response.ok or not data.get("ok"):
+        raise RuntimeError("Telegram getUpdates не повернув дані")
+    for update in data.get("result", []):
+        for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+            event = update.get(key) or {}
+            chat = event.get("chat") or {}
+            sender = event.get("from") or {}
+            if chat.get("type") != "private":
+                continue
+            usernames = {
+                str(chat.get("username") or "").lstrip("@").casefold(),
+                str(sender.get("username") or "").lstrip("@").casefold(),
+            }
+            if wanted in usernames and chat.get("id") is not None:
+                return str(chat["id"])
+    raise RuntimeError(
+        f"Не знайдено {candidate} у getUpdates. Напишіть боту /start, "
+        "або задайте PRIVATE_TEST_CHAT_ID числовим chat_id."
+    )
+
+
+def _schedule_daily(job, clock):
+    try:
+        return schedule.every().day.at(clock, "Europe/Kyiv").do(job)
+    except (TypeError, ValueError):
+        return schedule.every().day.at(clock).do(job)
+
+
+_INSTANCE_LOCK_HANDLE = None
+
+
+def _acquire_single_instance():
+    """Prevent two local bot processes from sending duplicate messages."""
+    global _INSTANCE_LOCK_HANDLE
+    try:
+        handle = open("bot.instance.lock", "a+")
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            import msvcrt
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except (BlockingIOError, OSError):
+            handle.close()
+            return False
+        _INSTANCE_LOCK_HANDLE = handle
+        return True
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
+    if "--preview-schedule" in sys.argv or "--test-schedule" in sys.argv:
+        if "--test-schedule" in sys.argv:
+            try:
+                index = sys.argv.index("--test-schedule")
+                argument = sys.argv[index + 1] if index + 1 < len(sys.argv) else None
+                target = _resolve_private_test_target(argument)
+                raise SystemExit(0 if check_schedule(force=True, target_chat_id=target) else 1)
+            except Exception as exc:
+                log(f"❌ Приватний тест не виконано: {exc}")
+                raise SystemExit(1)
+        try:
+            index = sys.argv.index("--preview-schedule")
+            argument = sys.argv[index + 1] if index + 1 < len(sys.argv) else None
+            preview_day = date.fromisoformat(argument) if argument and not argument.startswith("--") else None
+            result = check_schedule(force=True, dry_run=True, target_day=preview_day)
+            raise SystemExit(0 if result else 1)
+        except ValueError:
+            log("❌ Дата preview має формат YYYY-MM-DD.")
+            raise SystemExit(1)
+
     # Перевірка наявності обов'язкових змінних оточення
     missing = []
-    for var in ['TELEGRAM_TOKEN', 'CHANNEL_ID', 'SCHEDULE_URL', 'BIRTHDAY_SHEET_URL', 'SCHEDULE_GROUP']:
+    for var in ['TELEGRAM_TOKEN', 'CHANNEL_ID', 'BIRTHDAY_SHEET_URL', 'SCHEDULE_GROUP',
+                'BASE_SCHEDULE_CSV_URL', 'SUBJECTS_CSV_URL', 'SEMESTER_CSV_URL',
+                'REPLACEMENTS_CSV_URL']:
         if not os.getenv(var):
             missing.append(var)
     if missing:
         print(f"❌ Помилка: Не знайдено обов'язкових змінних у .env: {', '.join(missing)}")
         print("   Скопіюйте .env.example в .env та заповніть значення.")
         exit(1)
+
+    if not _acquire_single_instance():
+        print("❌ Інший екземпляр бота вже працює; запуск скасовано.")
+        raise SystemExit(2)
 
     # Діагностика при запуску
     print_startup_status()
@@ -535,8 +804,8 @@ if __name__ == "__main__":
     run_missed_tasks()
 
     # Плануємо щоденні завдання
-    schedule.every().day.at(SCHEDULE_CHECK_TIME).do(check_schedule)
-    schedule.every().day.at(BIRTHDAY_CHECK_TIME).do(process_birthdays)
+    _schedule_daily(check_schedule, SCHEDULE_CHECK_TIME)
+    _schedule_daily(process_birthdays, BIRTHDAY_CHECK_TIME)
 
     log(f"📅 Планувальник активовано. Чекаю наступну задачу...")
 
