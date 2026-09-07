@@ -37,10 +37,22 @@ load_dotenv()
 # --- Конфігурація з .env файлу ---
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')       # Токен Телеграм-бота
 CHANNEL_ID = os.getenv('CHANNEL_ID')               # ID Телеграм-групи/каналу
-SCHEDULE_URL = os.getenv('SCHEDULE_URL')            # Посилання на таблицю розкладу
+# HTML-версія старої таблиці замін, яка використовується для скріншота.
+# SCHEDULE_URL збережено як назву для сумісності зі старим .env.
+SCHEDULE_URL = os.getenv('SCHEDULE_URL')
+REPLACEMENTS_HTML_URL = os.getenv('REPLACEMENTS_HTML_URL') or SCHEDULE_URL
 BIRTHDAY_SHEET_URL = os.getenv('BIRTHDAY_SHEET_URL')  # Посилання на таблицю днів народження
-SCHEDULE_CHECK_TIME = os.getenv('SCHEDULE_CHECK_TIME', '17:00')  # Час перевірки розкладу
 BIRTHDAY_CHECK_TIME = os.getenv('BIRTHDAY_CHECK_TIME', '08:00')  # Час перевірки ДН
+# Ранковий анонс розкладу і вечірня перевірка замін — різні задачі.
+SCHEDULE_ANNOUNCEMENT_TIME = os.getenv('SCHEDULE_ANNOUNCEMENT_TIME', '08:00')
+# SCHEDULE_CHECK_TIME — стара назва вечірньої перевірки; залишаємо fallback,
+# щоб оновлення .env не було обов'язковим для старих інсталяцій.
+REPLACEMENTS_CHECK_TIME = os.getenv(
+    'REPLACEMENTS_CHECK_TIME',
+    os.getenv('SCHEDULE_CHECK_TIME', '17:00'),
+)
+# Публічне ім'я для старих викликів/інтеграцій.
+SCHEDULE_CHECK_TIME = REPLACEMENTS_CHECK_TIME
 
 # Назва групи для пошуку (наприклад: "Т-22", "А-31", "КІ-15")
 SCHEDULE_GROUP = os.getenv('SCHEDULE_GROUP', 'T-32')
@@ -98,10 +110,28 @@ def save_state(state):
         json.dump(state, f, indent=4)
 
 
-def mark_schedule_checked():
-    """Позначає, що розклад на сьогодні вже перевірений."""
+def mark_schedule_announcement(target_day=None):
+    """Позначає успішний ранковий анонс базового розкладу."""
+    target_day = target_day or _kyiv_now().date()
     state = load_state()
-    state['last_schedule_check'] = datetime.now().strftime('%Y-%m-%d')
+    state['last_schedule_announcement'] = target_day.isoformat()
+    save_state(state)
+    log("💾 Ранковий анонс розкладу позначено виконаним.")
+
+
+def mark_replacements_checked(target_day=None):
+    """Позначає успішну вечірню перевірку таблиці замін."""
+    target_day = target_day or _kyiv_now().date()
+    state = load_state()
+    state['last_replacements_check'] = target_day.isoformat()
+    save_state(state)
+    log("💾 Перевірку замін позначено виконаною.")
+
+
+def mark_schedule_checked():
+    """Сумісність зі старою версією: маркер перевірки розкладу."""
+    state = load_state()
+    state['last_schedule_check'] = _kyiv_now().date().isoformat()
     save_state(state)
     log("💾 Записав у файл: Розклад на сьогодні перевірено.")
 
@@ -153,7 +183,9 @@ def print_startup_status():
     log("🤖 БОТ ЗАПУЩЕНИЙ. ДІАГНОСТИКА СТАНУ:")
 
     state = load_state()
-    print(f"   📅 Остання перевірка розкладу: {state.get('last_schedule_check', 'Ніколи')}")
+    print(f"   📅 Останній ранковий анонс: {state.get('last_schedule_announcement', 'Ніколи')}")
+    print(f"   🔎 Остання перевірка замін: {state.get('last_replacements_check', 'Ніколи')}")
+    print(f"   ⏰ Анонс / ДН / заміни: {SCHEDULE_ANNOUNCEMENT_TIME} / {BIRTHDAY_CHECK_TIME} / {REPLACEMENTS_CHECK_TIME}")
     print(f"   🎂 Вже привітали в цьому році: {len(state.get('greeted_birthdays', []))} людей")
     print(f"   🔍 Група для пошуку: {SCHEDULE_GROUP}")
 
@@ -236,7 +268,7 @@ def is_schedule_check_allowed():
     - Неділя: НЕ перевіряємо (щоб не спамити)
     - Інші дні: перевіряємо як зазвичай
     """
-    today = datetime.now()
+    today = _kyiv_now()
     weekday = today.weekday()  # 0=Пн, 1=Вт, 2=Ср, 3=Чт, 4=Пт, 5=Сб, 6=Нд
 
     if weekday in (5, 6):  # Субота або Неділя
@@ -341,122 +373,80 @@ def find_group_in_text(text):
 #  ПЕРЕВІРКА РОЗКЛАДУ (основна функція)
 # =============================================================================
 
-def _legacy_check_schedule(force=False):
-    """
-    Перевіряє розклад на наявність групи.
+def check_replacements_screenshot(force=False):
+    """Перевіряє стару таблицю замін і надсилає її скріншот для нашої групи."""
+    log("🔎 Починаю перевірку таблиці замін...")
 
-    Алгоритм:
-    1. Перевіряє, чи не вихідний (субота/неділя — пропускає)
-    2. Перевіряє, чи сьогодні вже перевіряли (щоб не дублювати)
-    3. Відкриває Google Sheets через Selenium (Chrome)
-    4. Шукає назву групи в тексті таблиці
-    5. Якщо знайдено — робить скріншот і відправляє в Телеграм
-
-    Аргументи:
-        force: Якщо True — перевіряє незалежно від вихідних та попередніх перевірок.
-               Використовується при запуску бота для наздоганяння пропущених перевірок.
-    """
-    log("🔎 Починаю перевірку розкладу...")
-
-    # Перевірка: чи не вихідний
     if not force and not is_schedule_check_allowed():
-        return
+        return False
 
+    target_day = _kyiv_now().date()
+    today_str = target_day.isoformat()
     state = load_state()
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    if not force and state.get("last_replacements_check") == today_str:
+        log("✅ Таблицю замін за сьогодні вже перевірено. Пропускаю.")
+        return False
 
-    if not force and state.get('last_schedule_check') == today_str:
-        log("✅ Цей день вже перевірено і збережено в логах. Пропускаю.")
-        return
+    if not REPLACEMENTS_HTML_URL:
+        log("❌ Не задано REPLACEMENTS_HTML_URL або SCHEDULE_URL; скріншот не зроблено.")
+        return False
 
-    # Налаштування Chrome у фоновому режимі (без вікна)
     chrome_options = Options()
-    chrome_options.add_argument("--headless")              # Без вікна браузера
-    chrome_options.add_argument("--no-sandbox")            # Для серверів
-    chrome_options.add_argument("--window-size=1000,1300") # Розмір скріншота
-    chrome_options.add_argument("--disable-dev-shm-usage") # Для серверів з малою RAM
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--window-size=1000,1300")
+    chrome_options.add_argument("--disable-dev-shm-usage")
 
     driver = None
+    filename = None
     try:
-        # Запускаємо Chrome (драйвер завантажується автоматично)
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-        driver.get(SCHEDULE_URL)
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options,
+        )
+        driver.get(REPLACEMENTS_HTML_URL)
 
-        # Чекаємо поки таблиця завантажиться (до 20 секунд)
         try:
-            WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "td")))
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.TAG_NAME, "td"))
+            )
         except Exception:
             pass
 
-        # Витягуємо текст з таблиці та чистимо від нерозривних пробілів
         full_text = driver.find_element(By.TAG_NAME, "body").text
-        clean_text = full_text.replace('\xa0', ' ')
-
-        # Шукаємо групу (враховує всі варіації написання)
+        clean_text = full_text.replace("\xa0", " ")
         found_matches = find_group_in_text(clean_text)
 
         if found_matches:
-            found_str = ", ".join(set(found_matches))
-            log(f"🚨 ЗНАЙДЕНО ГРУПУ: {found_str}")
-
-            # Робимо скріншот розкладу
-            filename = f"schedule_{int(time.time())}.png"
+            found_str = ", ".join(sorted(set(found_matches)))
+            log(f"🚨 ЗНАЙДЕНО ГРУПУ В ЗАМІНАХ: {found_str}")
+            filename = f"replacements_{int(time.time())}.png"
             driver.save_screenshot(filename)
-
-            # Формуємо та відправляємо повідомлення
-            caption = f"🚨 **Зміни в розкладі!**\nЗнайдено: `{found_str}`"
+            caption = "🚨 *Зміни в розкладі!*\nЗнайдено: " + found_str
             if force:
                 caption += "\n_(Перевірка після відновлення роботи бота)_"
-
-            send_photo(filename, caption)
-
-            # Видаляємо тимчасовий скріншот
-            if os.path.exists(filename):
-                os.remove(filename)
+            if not send_photo(filename, caption):
+                log("⚠️ Скріншот замін не підтверджено Telegram.")
         else:
-            log(f"💤 Групу {SCHEDULE_GROUP} не знайдено (розклад чистий).")
+            log(f"💤 Групу {SCHEDULE_GROUP} у таблиці замін не знайдено (розклад чистий).")
 
-        mark_schedule_checked()
-
-    except Exception as e:
-        log(f"❌ Помилка Selenium: {e}")
+        mark_replacements_checked(target_day)
+        return True
+    except Exception as exc:
+        log(f"❌ Помилка перевірки таблиці замін: {exc}")
+        return False
     finally:
+        if filename and os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
         if driver:
             driver.quit()
 
-
-# =============================================================================
-#  ПЕРЕВІРКА ПРОПУЩЕНИХ ЗАВДАНЬ (при запуску бота)
-# =============================================================================
-
-def _legacy_run_missed_tasks():
-    """
-    Перевіряє, чи не пропущені завдання за сьогодні.
-
-    Якщо бот був вимкнений і пропустив запланований час перевірки,
-    ця функція виконає перевірку при запуску.
-    """
-    log("🔄 Перевіряю пропущені завдання...")
-    now = datetime.now()
-
-    target_hour = int(SCHEDULE_CHECK_TIME.split(':')[0])
-
-    state = load_state()
-    today_str = now.strftime('%Y-%m-%d')
-
-    if now.hour >= target_hour:
-        if state.get('last_schedule_check') != today_str:
-            log(f"⚠️ Увага! Вже вечір ({now.strftime('%H:%M')}), а запису про перевірку немає.")
-            log("🚀 Запускаю примусову перевірку розкладу...")
-            check_schedule(force=True)
-        else:
-            log("✅ Розклад на сьогодні вже був перевірений раніше.")
-    else:
-        log(f"🕒 Ще рано для розкладу (Чекаємо {SCHEDULE_CHECK_TIME}).")
-
-    # Також перевіряємо дні народження
-    process_birthdays()
-
+# Legacy startup task runner was replaced by run_missed_tasks below, which handles
+# the morning announcement, daily birthdays, and evening replacement screenshot
+# independently.
 
 # =============================================================================
 #  ПРИВІТАННЯ З ДНЕМ НАРОДЖЕННЯ
@@ -618,17 +608,14 @@ def send_photo(photo_path, caption, chat_id=None):
 def check_schedule(force=False, target_chat_id=None, dry_run=False, target_day=None):
     """Build and send the data-driven daily schedule announcement."""
     now = _kyiv_now()
-    target_day = target_day or _next_school_day(now.date())
-    if not force and now.weekday() >= 5:
+    target_day = target_day or now.date()
+    if not force and target_day.weekday() >= 5:
         log("🛌 Вихідний: анонс розкладу не потрібен.")
         return False
 
     state = load_state()
     today_str = target_day.isoformat()
-    if not force and (
-        state.get("last_schedule_announcement") == today_str
-        or state.get("last_schedule_check") == today_str
-    ):
+    if not force and state.get("last_schedule_announcement") == today_str:
         log("✅ Анонс розкладу за сьогодні вже відправлено. Пропускаю.")
         return False
 
@@ -657,35 +644,65 @@ def check_schedule(force=False, target_chat_id=None, dry_run=False, target_day=N
 
     # A private test must never mark the group announcement as complete.
     if target_chat_id is None:
-        state = load_state()
-        state["last_schedule_announcement"] = today_str
-        state["last_schedule_check"] = today_str
-        save_state(state)
-        log("💾 Анонс розкладу позначено виконаним на сьогодні.")
+        mark_schedule_announcement(target_day)
     return True
 
 
+def _run_scheduled_schedule_announcement():
+    """Плановий ранковий анонс розкладу лише в робочі дні."""
+    now = _kyiv_now()
+    if now.weekday() >= 5:
+        log("🛌 Вихідний: ранковий анонс розкладу не потрібен.")
+        return False
+    return check_schedule(target_day=now.date())
+
+
+def _run_scheduled_replacements_check():
+    """Планова вечірня перевірка старої таблиці замін лише в робочі дні."""
+    now = _kyiv_now()
+    if now.weekday() >= 5:
+        log("🛌 Вихідний: перевірку замін пропускаю.")
+        return False
+    return check_replacements_screenshot()
+
+
 def run_missed_tasks():
-    """Run only the jobs whose Kyiv-time schedule has already passed."""
+    """Run each independent job if its Kyiv-time deadline has passed."""
     now = _kyiv_now()
     log("🔄 Перевіряю пропущені завдання...")
     state = load_state()
-    schedule_day = _next_school_day(now.date())
-    schedule_day_str = schedule_day.isoformat()
+    today_str = now.date().isoformat()
+    is_weekday = now.weekday() < 5
 
-    if _time_reached(now, SCHEDULE_CHECK_TIME):
-        if state.get("last_schedule_announcement") != schedule_day_str and state.get("last_schedule_check") != schedule_day_str:
-            check_schedule(force=False)
+    # 1. Ранковий анонс розкладу: понеділок-п'ятниця о 08:00.
+    if is_weekday:
+        if _time_reached(now, SCHEDULE_ANNOUNCEMENT_TIME):
+            if state.get("last_schedule_announcement") != today_str:
+                check_schedule(target_day=now.date())
+            else:
+                log("✅ Ранковий анонс розкладу за сьогодні вже відправлено.")
         else:
-            log("✅ Розклад на сьогодні вже був відправлений.")
+            log(f"🕒 Для ранкового анонсу ще рано; час запуску {SCHEDULE_ANNOUNCEMENT_TIME}.")
     else:
-        log(f"🕒 Для розкладу ще рано; час запуску {SCHEDULE_CHECK_TIME}.")
+        log("🛌 Вихідний: ранковий анонс розкладу пропускаю.")
 
+    # 2. Дні народження: щодня о 08:00, включно з вихідними.
     if _time_reached(now, BIRTHDAY_CHECK_TIME):
         process_birthdays()
     else:
         log(f"🕒 Для привітань ще рано; час запуску {BIRTHDAY_CHECK_TIME}.")
 
+    # 3. Стара перевірка таблиці замін зі скріншотом: робочі дні о 17:00.
+    if is_weekday:
+        if _time_reached(now, REPLACEMENTS_CHECK_TIME):
+            if state.get("last_replacements_check") != today_str:
+                check_replacements_screenshot()
+            else:
+                log("✅ Таблицю замін за сьогодні вже перевірено.")
+        else:
+            log(f"🕒 Для перевірки замін ще рано; час запуску {REPLACEMENTS_CHECK_TIME}.")
+    else:
+        log("🛌 Вихідний: вечірню перевірку замін пропускаю.")
 
 def _resolve_private_test_target(username=None):
     """Resolve @username to a private chat id from updates, never to CHANNEL_ID."""
@@ -803,9 +820,10 @@ if __name__ == "__main__":
     # Виконуємо пропущені завдання (якщо бот був вимкнений)
     run_missed_tasks()
 
-    # Плануємо щоденні завдання
-    _schedule_daily(check_schedule, SCHEDULE_CHECK_TIME)
+    # Плануємо три незалежні завдання.
+    _schedule_daily(_run_scheduled_schedule_announcement, SCHEDULE_ANNOUNCEMENT_TIME)
     _schedule_daily(process_birthdays, BIRTHDAY_CHECK_TIME)
+    _schedule_daily(_run_scheduled_replacements_check, REPLACEMENTS_CHECK_TIME)
 
     log(f"📅 Планувальник активовано. Чекаю наступну задачу...")
 
@@ -813,3 +831,13 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+
+
+
+
+
+
+
+
+

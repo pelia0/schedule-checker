@@ -3,8 +3,8 @@
 
 import unittest
 import os
-from datetime import date
-from unittest.mock import patch
+from datetime import date, datetime
+from unittest.mock import patch, Mock
 
 import schedule_announcements as schedule_data
 
@@ -172,5 +172,81 @@ class TelegramSafetyTests(unittest.TestCase):
         )
 
 
+
+class SchedulerSplitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import bot
+        cls.bot = bot
+
+    def test_weekday_morning_runs_announcement_and_birthdays_only(self):
+        bot = self.bot
+        now = datetime(2026, 9, 7, 8, 1)
+        with patch.object(bot, "_kyiv_now", return_value=now), \
+             patch.object(bot, "load_state", return_value={}), \
+             patch.object(bot, "check_schedule") as announcement, \
+             patch.object(bot, "process_birthdays") as birthdays, \
+             patch.object(bot, "check_replacements_screenshot") as replacements:
+            bot.run_missed_tasks()
+        announcement.assert_called_once_with(target_day=date(2026, 9, 7))
+        birthdays.assert_called_once_with()
+        replacements.assert_not_called()
+
+    def test_weekday_evening_runs_missed_morning_and_replacement_jobs(self):
+        bot = self.bot
+        now = datetime(2026, 9, 7, 17, 1)
+        with patch.object(bot, "_kyiv_now", return_value=now), \
+             patch.object(bot, "load_state", return_value={}), \
+             patch.object(bot, "check_schedule") as announcement, \
+             patch.object(bot, "process_birthdays") as birthdays, \
+             patch.object(bot, "check_replacements_screenshot") as replacements:
+            bot.run_missed_tasks()
+        announcement.assert_called_once_with(target_day=date(2026, 9, 7))
+        birthdays.assert_called_once_with()
+        replacements.assert_called_once_with()
+
+    def test_weekend_runs_birthdays_but_not_weekday_jobs(self):
+        bot = self.bot
+        now = datetime(2026, 9, 6, 8, 1)
+        with patch.object(bot, "_kyiv_now", return_value=now), \
+             patch.object(bot, "load_state", return_value={}), \
+             patch.object(bot, "check_schedule") as announcement, \
+             patch.object(bot, "process_birthdays") as birthdays, \
+             patch.object(bot, "check_replacements_screenshot") as replacements:
+            bot.run_missed_tasks()
+        announcement.assert_not_called()
+        birthdays.assert_called_once_with()
+        replacements.assert_not_called()
+
+class ReplacementScreenshotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import bot
+        cls.bot = bot
+
+    def test_replacement_screenshot_uses_html_source_and_own_marker(self):
+        bot = self.bot
+        fake_driver = Mock()
+        fake_driver.find_element.return_value.text = "T-32"
+        manager = Mock()
+        manager.return_value.install.return_value = "driver"
+        waiter = Mock()
+        html_url = bot.REPLACEMENTS_HTML_URL
+        with patch.object(bot, "_kyiv_now", return_value=datetime(2026, 9, 7, 17, 1)), \
+             patch.object(bot, "load_state", return_value={}), \
+             patch.object(bot, "mark_replacements_checked") as mark, \
+             patch.object(bot, "send_photo", return_value=True) as send_photo, \
+             patch.object(bot.webdriver, "Chrome", return_value=fake_driver) as chrome, \
+             patch.object(bot, "ChromeDriverManager", manager), \
+             patch.object(bot, "WebDriverWait", return_value=waiter), \
+             patch.object(bot, "SCHEDULE_GROUP", "T-32"):
+            self.assertTrue(bot.check_replacements_screenshot())
+        chrome.assert_called_once()
+        fake_driver.get.assert_called_once_with(html_url)
+        fake_driver.save_screenshot.assert_called_once()
+        send_photo.assert_called_once()
+        mark.assert_called_once_with(date(2026, 9, 7))
 if __name__ == "__main__":
     unittest.main()
+
+
