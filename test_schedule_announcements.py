@@ -3,6 +3,8 @@
 
 import unittest
 import os
+import json
+import tempfile
 from datetime import date, datetime
 from unittest.mock import patch, Mock
 
@@ -14,7 +16,7 @@ class ScheduleParserTests(unittest.TestCase):
         self.subject_rows = [
             ["Предмет", "Скорочення", "Посилання", "Викладач"],
             ["Комерційна діяльність та технологія торгівлі", "КД", "https://example.test/zoom", "Непочатова Г.В."],
-            ["Облік, оподаткування та страхування в комерційній діяльності", "ООСвКД", "", "Попова І.А."],
+            ["Облік, оподаткування та страхування в комерційній діяльності", "ООСвКД", "https://example.test/accounting", "Попова І.А."],
         ]
         self.directory = schedule_data.parse_subjects(self.subject_rows)
 
@@ -27,6 +29,45 @@ class ScheduleParserTests(unittest.TestCase):
         item = schedule_data.resolve_subject("КД (ауд. 201)", self.directory)
         self.assertTrue(item["known"])
         self.assertEqual(item["subject"], "Комерційна діяльність та технологія торгівлі")
+
+    def test_partial_title_takes_priority_over_another_subjects_short_alias(self):
+        for raw in (
+            "Облік, оподаткування та страхування в КД",
+            "облік оподаткування та страхування в кд",
+            "Облік, оподаткування та страхування в К.Д.",
+        ):
+            with self.subTest(raw=raw):
+                item = schedule_data.resolve_subject(raw, self.directory)
+                self.assertTrue(item["known"])
+                self.assertEqual(item["subject"], "Облік, оподаткування та страхування в комерційній діяльності")
+                self.assertEqual(item["url"], "https://example.test/accounting")
+
+    def test_partial_title_expansion_uses_subjects_from_the_directory(self):
+        directory = schedule_data.parse_subjects([
+            ["Предмет", "Скорочення", "Посилання", "Викладач"],
+            ["Технологія і організація готельного господарства", "ТОГГ", "https://example.test/hotel", "Викладач"],
+        ])
+        item = schedule_data.resolve_subject("Технологія і організація ГГ", directory)
+        self.assertTrue(item["known"])
+        self.assertEqual(item["subject"], "Технологія і організація готельного господарства")
+        self.assertEqual(item["url"], "https://example.test/hotel")
+
+    def test_ambiguous_partial_title_does_not_fall_back_to_short_alias(self):
+        directory = schedule_data.parse_subjects(self.subject_rows + [
+            ["Облік, оподаткування та страхування в кредитній діяльності", "ООСвКрД", "https://example.test/credit", "Інший викладач"],
+        ])
+        raw = "Облік, оподаткування та страхування в КД"
+        item = schedule_data.resolve_subject(raw, directory)
+        self.assertFalse(item["known"])
+        self.assertEqual(item["subject"], raw)
+        self.assertEqual(item["url"], "")
+
+    def test_unknown_title_cannot_be_resolved_by_an_alias_inside_it(self):
+        raw = "Нова дисципліна в КД"
+        item = schedule_data.resolve_subject(raw, self.directory)
+        self.assertFalse(item["known"])
+        self.assertEqual(item["subject"], raw)
+        self.assertEqual(item["url"], "")
 
     def test_group_matching_is_boundary_aware(self):
         self.assertTrue(schedule_data.group_matches("Т-32", "T-32"))
@@ -108,6 +149,230 @@ class ScheduleParserTests(unittest.TestCase):
         self.assertIn("🪟 Вікно", message)
         self.assertIn("🔄", message)
         self.assertFalse(diagnostics["replacement_info"]["ignored"])
+
+    def test_morning_announcement_uses_accounting_link_for_partial_title(self):
+        sources = {
+            "base": [["", "П'ятниця", "Четвер"], ["8:30-9:50", "---", ""], ["", "", ""]],
+            "subjects": self.subject_rows,
+            "semester": [["НАД РИСКОЮ", "ПІД РИСКОЮ"], ["14.09.2026-20.09.2026", "21.09.2026-27.09.2026"]],
+            "replacements": [
+                ["Розпорядження про заміну занять на П'ЯТНИЦЮ 25.09.2026 ПІД рискою"],
+                ["", "Т - 32", "1", "Облік, оподаткування та страхування в КД", "", "Попова І.А.", "", "Розклад дзвінків", "", ""],
+            ],
+        }
+        config = {
+            "BASE_SCHEDULE_CSV_URL": "base",
+            "SUBJECTS_CSV_URL": "subjects",
+            "SEMESTER_CSV_URL": "semester",
+            "REPLACEMENTS_CSV_URL": "replacements",
+            "SCHEDULE_GROUP": "T-32",
+        }
+        with patch.dict(os.environ, config), patch.object(
+            schedule_data, "fetch_with_cache", side_effect=lambda url, key: (sources[key], False),
+        ):
+            message, diagnostics = schedule_data.build_daily_announcement(date(2026, 9, 25))
+        self.assertIn("8:30–9:50", message)
+        self.assertIn("🔄 Облік, оподаткування та страхування в комерційній діяльності", message)
+        self.assertIn('href="https://example.test/accounting"', message)
+        self.assertNotIn('href="https://example.test/zoom"', message)
+        self.assertIn("Попова І.А.", message)
+        self.assertEqual(diagnostics["unknown_subjects"], [])
+
+
+class GeminiSubjectMatcherTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.cache_path = os.path.join(self.temp_dir.name, "gemini-cache.json")
+        self.env_patcher = patch.dict(os.environ, {"GEMINI_MATCH_CACHE_FILE": self.cache_path}, clear=False)
+        self.env_patcher.start()
+        self.addCleanup(self.env_patcher.stop)
+        self.directory = schedule_data.parse_subjects([
+            ["Предмет", "Скорочення", "Посилання", "Викладач"],
+            ["Комерційна діяльність та технологія торгівлі", "КД", "https://example.test/commerce", "Непочатова Г.В."],
+            ["Облік, оподаткування та страхування в комерційній діяльності", "ООСвКД", "https://example.test/accounting", "Попова І.А."],
+        ])
+
+    @staticmethod
+    def _response(matches):
+        response = Mock()
+        response.json.return_value = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": json.dumps({"matches": matches})}]},
+            }],
+        }
+        return response
+
+    def test_gemini_selects_a_subject_from_the_live_directory(self):
+        raw = "Облік, оподаткування та страхування в КД"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "S001"},
+            ]),
+        ) as post:
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+
+        self.assertEqual(matches[schedule_data.normalized(raw)]["subject"], "Облік, оподаткування та страхування в комерційній діяльності")
+        self.assertEqual(matches[schedule_data.normalized(raw)]["url"], "https://example.test/accounting")
+        request = post.call_args
+        self.assertEqual(request.kwargs["headers"]["x-goog-api-key"], "test-key")
+        body = json.dumps(request.kwargs["json"], ensure_ascii=False)
+        self.assertIn(raw, body)
+        self.assertIn("Облік, оподаткування та страхування в комерційній діяльності", body)
+        self.assertNotIn("https://example.test", body)
+        self.assertNotIn("Попова", body)
+
+    def test_gemini_none_leaves_the_subject_unmatched(self):
+        raw = "Незрозумілий предмет"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "NONE"},
+            ]),
+        ):
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+        self.assertEqual(matches, {})
+
+    def test_gemini_cannot_return_a_subject_outside_the_directory(self):
+        raw = "Невідома назва"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "invented-subject"},
+            ]),
+        ):
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+        self.assertEqual(matches, {})
+
+    def test_gemini_resolves_multiple_unknown_labels_in_one_request(self):
+        raw_subjects = ["Облік та страхування у КД", "КД та торгівля"]
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "S001"},
+                {"query_id": "Q001", "subject_id": "S000"},
+            ]),
+        ) as post:
+            matches = schedule_data.match_unknown_subjects(raw_subjects, self.directory)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(matches[schedule_data.normalized(raw_subjects[0])]["subject"], "Облік, оподаткування та страхування в комерційній діяльності")
+        self.assertEqual(matches[schedule_data.normalized(raw_subjects[1])]["subject"], "Комерційна діяльність та технологія торгівлі")
+
+    def test_gemini_reuses_mapping_and_reads_current_directory_link(self):
+        raw = "Облік та страхування у КД"
+        rows = [
+            ["Предмет", "Скорочення", "Посилання", "Викладач"],
+            ["Комерційна діяльність та технологія торгівлі", "КД", "https://example.test/commerce", "Непочатова Г.В."],
+            ["Облік, оподаткування та страхування в комерційній діяльності", "ООСвКД", "https://example.test/accounting", "Попова І.А."],
+        ]
+        updated_rows = [row[:] for row in rows]
+        updated_rows[2][2] = "https://example.test/accounting-updated"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "gemini-cache.json")
+            environment = {"GEMINI_API_KEY": "test-key", "GEMINI_MATCH_CACHE_FILE": cache_path}
+            with patch.dict(os.environ, environment, clear=False), patch.object(
+                schedule_data.requests, "post", return_value=self._response([
+                    {"query_id": "Q000", "subject_id": "S001"},
+                ]),
+            ) as post:
+                first = schedule_data.match_unknown_subjects([raw], schedule_data.parse_subjects(rows))
+                second = schedule_data.match_unknown_subjects([raw], schedule_data.parse_subjects(updated_rows))
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(first[schedule_data.normalized(raw)]["url"], "https://example.test/accounting")
+        self.assertEqual(second[schedule_data.normalized(raw)]["url"], "https://example.test/accounting-updated")
+
+    def test_gemini_cache_is_invalidated_when_the_subject_catalog_changes(self):
+        raw = "Облік та страхування у КД"
+        rows = [
+            ["Предмет", "Скорочення", "Посилання", "Викладач"],
+            ["Комерційна діяльність та технологія торгівлі", "КД", "https://example.test/commerce", "Непочатова Г.В."],
+            ["Облік, оподаткування та страхування в комерційній діяльності", "ООСвКД", "https://example.test/accounting", "Попова І.А."],
+        ]
+        changed_rows = [row[:] for row in rows]
+        changed_rows[2][0] = "Облік і страхування в комерційній діяльності"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", side_effect=[
+                self._response([{"query_id": "Q000", "subject_id": "S001"}]),
+                self._response([{"query_id": "Q000", "subject_id": "S001"}]),
+            ],
+        ) as post:
+            schedule_data.match_unknown_subjects([raw], schedule_data.parse_subjects(rows))
+            updated = schedule_data.match_unknown_subjects([raw], schedule_data.parse_subjects(changed_rows))
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(updated[schedule_data.normalized(raw)]["subject"], "Облік і страхування в комерційній діяльності")
+
+    def test_gemini_caches_unmatched_result_for_unchanged_catalog(self):
+        raw = "Незрозумілий предмет"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "NONE"},
+            ]),
+        ) as post:
+            first = schedule_data.match_unknown_subjects([raw], self.directory)
+            second = schedule_data.match_unknown_subjects([raw], self.directory)
+        self.assertEqual(first, {})
+        self.assertEqual(second, {})
+        self.assertEqual(post.call_count, 1)
+
+    def test_malformed_gemini_response_is_ignored(self):
+        response = Mock()
+        response.json.return_value = []
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=response,
+        ), self.assertLogs(schedule_data.__name__, level="WARNING"):
+            matches = schedule_data.match_unknown_subjects(["Невідома назва"], self.directory)
+        self.assertEqual(matches, {})
+
+    def test_gemini_is_skipped_when_api_key_is_not_configured(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(schedule_data.requests, "post") as post:
+            matches = schedule_data.match_unknown_subjects(["Новий предмет"], self.directory)
+        self.assertEqual(matches, {})
+        post.assert_not_called()
+
+    def test_api_failure_leaves_subject_unmatched_without_raising(self):
+        raw = "Невідома назва"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", side_effect=schedule_data.requests.Timeout,
+        ), self.assertLogs(schedule_data.__name__, level="WARNING"):
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+        self.assertEqual(matches, {})
+
+    def test_morning_announcement_uses_gemini_match_and_official_link(self):
+        raw = "Облік та страхування у КД"
+        sources = {
+            "base": [["", "Понеділок", "Вівторок"], ["8:30-9:50", "---", "---"], ["", "", ""]],
+            "subjects": self.directory["entries"],
+            "semester": [["НАД РИСКОЮ", "ПІД РИСКОЮ"], ["31.08.2026-06.09.2026", "07.09.2026-13.09.2026"]],
+            "replacements": [["на 07.09.2026"], ["", "Т-32", "1", raw, "", "Заміна В.В."]],
+        }
+        sources["subjects"] = [
+            ["Предмет", "Скорочення", "Посилання", "Викладач"],
+            *[[entry["subject"], entry["alias"], entry["url"], entry["teacher"]] for entry in self.directory["entries"]],
+        ]
+        config = {
+            "BASE_SCHEDULE_CSV_URL": "base",
+            "SUBJECTS_CSV_URL": "subjects",
+            "SEMESTER_CSV_URL": "semester",
+            "REPLACEMENTS_CSV_URL": "replacements",
+            "SCHEDULE_GROUP": "T-32",
+        }
+        with patch.dict(os.environ, config, clear=False), patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data, "fetch_with_cache", side_effect=lambda url, key: (sources[key], False),
+        ), patch.object(
+            schedule_data.requests, "post", return_value=self._response([
+                {"query_id": "Q000", "subject_id": "S001"},
+            ]),
+        ):
+            message, diagnostics = schedule_data.build_daily_announcement(date(2026, 9, 7))
+
+        self.assertIn("🔄 Облік, оподаткування та страхування в комерційній діяльності", message)
+        self.assertIn('href="https://example.test/accounting"', message)
+        self.assertNotIn('href="https://example.test/commerce"', message)
+        self.assertIn("Заміна В.В.", message)
+        self.assertIn("Gemini", message)
+        self.assertEqual(diagnostics["unknown_subjects"], [])
+        self.assertEqual(diagnostics["ai_matches"], [{
+            "raw": raw,
+            "subject": "Облік, оподаткування та страхування в комерційній діяльності",
+        }])
 
 
 class TelegramSafetyTests(unittest.TestCase):
