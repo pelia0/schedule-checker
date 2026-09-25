@@ -4,9 +4,10 @@
 import unittest
 import os
 import json
+import hashlib
 import tempfile
 from datetime import date, datetime
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, call
 
 import schedule_announcements as schedule_data
 
@@ -126,7 +127,7 @@ class ScheduleParserTests(unittest.TestCase):
         ]
         replacement_rows = [
             ["на 07.09.2026"],
-            ["", "Т-32", "1", "ВІЛЬНА"],
+            ["", "Т-32", "1", "ВІЛЬНА", "", "НАД РИСКОЮ"],
         ]
         config = {
             "BASE_SCHEDULE_CSV_URL": "base",
@@ -148,6 +149,7 @@ class ScheduleParserTests(unittest.TestCase):
             message, diagnostics = schedule_data.build_daily_announcement(date(2026, 9, 7))
         self.assertIn("🪟 Вікно", message)
         self.assertIn("🔄", message)
+        self.assertNotIn("НАД РИСКОЮ", message)
         self.assertFalse(diagnostics["replacement_info"]["ignored"])
 
     def test_morning_announcement_uses_accounting_link_for_partial_title(self):
@@ -223,15 +225,117 @@ class GeminiSubjectMatcherTests(unittest.TestCase):
         self.assertNotIn("https://example.test", body)
         self.assertNotIn("Попова", body)
 
+    def test_gemini_retries_an_unresolved_subject_after_one_minute(self):
+        raw = "Облік та страхування у КД"
+        no_match = self._response([{"query_id": "Q000", "subject_id": "NONE"}])
+        match = self._response([{"query_id": "Q000", "subject_id": "S001"}])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", side_effect=[no_match, match],
+        ) as post, patch("time.sleep") as sleep:
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+
+        self.assertEqual(
+            matches.get(schedule_data.normalized(raw), {}).get("subject"),
+            "Облік, оподаткування та страхування в комерційній діяльності",
+        )
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(60)])
+
+    def test_gemini_uses_a_match_from_the_third_attempt(self):
+        raw = "Облік та страхування у КД"
+        no_match = self._response([{"query_id": "Q000", "subject_id": "NONE"}])
+        match = self._response([{"query_id": "Q000", "subject_id": "S001"}])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", side_effect=[no_match, no_match, match],
+        ) as post, patch("time.sleep") as sleep:
+            matches = schedule_data.match_unknown_subjects([raw], self.directory)
+
+        self.assertEqual(
+            matches.get(schedule_data.normalized(raw), {}).get("subject"),
+            "Облік, оподаткування та страхування в комерційній діяльності",
+        )
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
+
+    def test_gemini_retries_only_unresolved_labels(self):
+        raw_subjects = ["Облік та страхування у КД", "КД та торгівля"]
+        partial = self._response([
+            {"query_id": "Q000", "subject_id": "S001"},
+            {"query_id": "Q001", "subject_id": "NONE"},
+        ])
+        remaining = self._response([{"query_id": "Q001", "subject_id": "S000"}])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", side_effect=[partial, remaining],
+        ) as post, patch("time.sleep") as sleep:
+            matches = schedule_data.match_unknown_subjects(raw_subjects, self.directory)
+
+        self.assertEqual(
+            matches.get(schedule_data.normalized(raw_subjects[0]), {}).get("subject"),
+            "Облік, оподаткування та страхування в комерційній діяльності",
+        )
+        self.assertEqual(
+            matches.get(schedule_data.normalized(raw_subjects[1]), {}).get("subject"),
+            "Комерційна діяльність та технологія торгівлі",
+        )
+        self.assertEqual(post.call_count, 2)
+        first_prompt = post.call_args_list[0].kwargs["json"]["contents"][0]["parts"][0]["text"]
+        second_prompt = post.call_args_list[1].kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn(raw_subjects[0], first_prompt)
+        self.assertIn(raw_subjects[1], first_prompt)
+        self.assertNotIn(raw_subjects[0], second_prompt)
+        self.assertIn(raw_subjects[1], second_prompt)
+        self.assertEqual(sleep.call_args_list, [call(60)])
+
+    def test_gemini_falls_back_and_caches_only_after_three_failed_attempts(self):
+        raw = "Незрозумілий предмет"
+        no_match = self._response([{"query_id": "Q000", "subject_id": "NONE"}])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=no_match,
+        ) as post, patch("time.sleep") as sleep:
+            first = schedule_data.match_unknown_subjects([raw], self.directory)
+            second = schedule_data.match_unknown_subjects([raw], self.directory)
+
+        self.assertEqual(first, {})
+        self.assertEqual(second, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
+
+    def test_gemini_retries_legacy_cached_negative_result(self):
+        raw = "Незрозумілий предмет"
+        fingerprint = hashlib.sha256(json.dumps({
+            "model": schedule_data.GEMINI_MODEL,
+            "subjects": [
+                [schedule_data.normalized(entry["subject"]), schedule_data.normalized(entry.get("alias", ""))]
+                for entry in self.directory["entries"]
+            ],
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+        with open(self.cache_path, "w", encoding="utf-8") as cache_file:
+            json.dump({
+                "catalog_fingerprint": fingerprint,
+                "matches": {schedule_data.normalized(raw): None},
+            }, cache_file)
+
+        no_match = self._response([{"query_id": "Q000", "subject_id": "NONE"}])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
+            schedule_data.requests, "post", return_value=no_match,
+        ) as post, patch("time.sleep") as sleep:
+            result = schedule_data.match_unknown_subjects([raw], self.directory)
+
+        self.assertEqual(result, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
+
     def test_gemini_none_leaves_the_subject_unmatched(self):
         raw = "Незрозумілий предмет"
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
             schedule_data.requests, "post", return_value=self._response([
                 {"query_id": "Q000", "subject_id": "NONE"},
             ]),
-        ):
+        ) as post, patch("time.sleep") as sleep:
             matches = schedule_data.match_unknown_subjects([raw], self.directory)
         self.assertEqual(matches, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
 
     def test_gemini_cannot_return_a_subject_outside_the_directory(self):
         raw = "Невідома назва"
@@ -239,9 +343,11 @@ class GeminiSubjectMatcherTests(unittest.TestCase):
             schedule_data.requests, "post", return_value=self._response([
                 {"query_id": "Q000", "subject_id": "invented-subject"},
             ]),
-        ):
+        ) as post, patch("time.sleep") as sleep:
             matches = schedule_data.match_unknown_subjects([raw], self.directory)
         self.assertEqual(matches, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
 
     def test_gemini_resolves_multiple_unknown_labels_in_one_request(self):
         raw_subjects = ["Облік та страхування у КД", "КД та торгівля"]
@@ -305,21 +411,24 @@ class GeminiSubjectMatcherTests(unittest.TestCase):
             schedule_data.requests, "post", return_value=self._response([
                 {"query_id": "Q000", "subject_id": "NONE"},
             ]),
-        ) as post:
+        ) as post, patch("time.sleep") as sleep:
             first = schedule_data.match_unknown_subjects([raw], self.directory)
             second = schedule_data.match_unknown_subjects([raw], self.directory)
         self.assertEqual(first, {})
         self.assertEqual(second, {})
-        self.assertEqual(post.call_count, 1)
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
 
     def test_malformed_gemini_response_is_ignored(self):
         response = Mock()
         response.json.return_value = []
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
             schedule_data.requests, "post", return_value=response,
-        ), self.assertLogs(schedule_data.__name__, level="WARNING"):
+        ) as post, patch("time.sleep") as sleep, self.assertLogs(schedule_data.__name__, level="WARNING"):
             matches = schedule_data.match_unknown_subjects(["Невідома назва"], self.directory)
         self.assertEqual(matches, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
 
     def test_gemini_is_skipped_when_api_key_is_not_configured(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(schedule_data.requests, "post") as post:
@@ -331,9 +440,11 @@ class GeminiSubjectMatcherTests(unittest.TestCase):
         raw = "Невідома назва"
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=False), patch.object(
             schedule_data.requests, "post", side_effect=schedule_data.requests.Timeout,
-        ), self.assertLogs(schedule_data.__name__, level="WARNING"):
+        ) as post, patch("time.sleep") as sleep, self.assertLogs(schedule_data.__name__, level="WARNING"):
             matches = schedule_data.match_unknown_subjects([raw], self.directory)
         self.assertEqual(matches, {})
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [call(60), call(60)])
 
     def test_morning_announcement_uses_gemini_match_and_official_link(self):
         raw = "Облік та страхування у КД"
