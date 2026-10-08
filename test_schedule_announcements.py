@@ -73,8 +73,12 @@ class ScheduleParserTests(unittest.TestCase):
     def test_group_matching_is_boundary_aware(self):
         self.assertTrue(schedule_data.group_matches("Т-32", "T-32"))
         self.assertTrue(schedule_data.group_matches("Т32", "Т-32"))
+        self.assertTrue(schedule_data.group_matches("Т – 31,32", "Т-32"))
+        self.assertTrue(schedule_data.group_matches("T – 31, 32", "T32"))
         self.assertFalse(schedule_data.group_matches("ПТ-32", "Т-32"))
         self.assertFalse(schedule_data.group_matches("Т-321", "Т-32"))
+        self.assertFalse(schedule_data.group_matches("Т – 31,32", "Т-33"))
+        self.assertFalse(schedule_data.group_matches("ГРС – 31,32", "Т-32"))
 
     def test_replacements_reset_after_another_group(self):
         rows = [
@@ -87,6 +91,19 @@ class ScheduleParserTests(unittest.TestCase):
         replacements, info = schedule_data.parse_replacements(rows, date(2026, 9, 7), "T-32")
         self.assertEqual(sorted(replacements), [1, 2])
         self.assertEqual(replacements[1]["raw_subject"], "ВІЛЬНА")
+        self.assertEqual(info["duplicates"], [])
+
+    def test_replacements_reset_after_comma_group_header(self):
+        rows = [
+            ["Розпорядження про заміну на 08.10.2026 під рискою"],
+            ["", "Т-32", "4", "ВІЛЬНА"],
+            ["", "ГРС – 31,32", "4", "Основи національного спротиву", "", "Циганенко Р.П."],
+            ["", "А – 41,42", "1", "Основи національного спротиву", "", "Циганенко Р.П."],
+            ["", "А – 41,42", "4", "ВІЛЬНА"],
+        ]
+        replacements, info = schedule_data.parse_replacements(rows, date(2026, 10, 8), "T-32")
+        self.assertEqual(sorted(replacements), [4])
+        self.assertEqual(replacements[4]["raw_subject"], "ВІЛЬНА")
         self.assertEqual(info["duplicates"], [])
 
     def test_replacement_duplicates_are_reported(self):

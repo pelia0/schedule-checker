@@ -55,7 +55,10 @@ DATE_RANGE_RE = re.compile(
 )
 SINGLE_DATE_RE = re.compile(r"(?P<d>\d{1,2})[./-](?P<m>\d{1,2})[./-](?P<y>\d{4})")
 TIME_RE = re.compile(r"^\s*(\d{1,2}:\d{2})(?:\s*[-–—]\s*(\d{1,2}:\d{2}))?")
-GROUP_CELL_RE = re.compile(r"^[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,10}\s*[-–—]?\s*\d{1,3}$")
+GROUP_CELL_RE = re.compile(
+    r"^(?P<prefix>[A-Za-zА-Яа-яІіЇїЄєҐґ]{1,10})\s*[-–—]?\s*"
+    r"(?P<numbers>\d{1,3}(?:\s*[,/]\s*\d{1,3})*)$"
+)
 GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_TIMEOUT_SECONDS = 20
 GEMINI_MAX_ATTEMPTS = 3
@@ -92,15 +95,24 @@ def normalized_group(value):
     return re.sub(r"[^a-z0-9]", "", clean(value).casefold().translate(GROUP_TRANSLATION))
 
 
+def _group_parts(value):
+    match = GROUP_CELL_RE.fullmatch(clean(value))
+    if not match:
+        return None
+    numbers = {
+        int(part)
+        for part in re.split(r"[,/]", match.group("numbers"))
+    }
+    return normalized_group(match.group("prefix")), numbers
+
+
 def group_matches(value, target):
-    """Match a group label while rejecting prefixes such as ``ПТ-32``."""
-    target_norm = normalized_group(target)
-    value_norm = normalized_group(value)
-    if value_norm == target_norm:
-        return True
-    if not target_norm:
+    """Match a group label, including shared-prefix lists such as ``Т-31,32``."""
+    value_parts = _group_parts(value)
+    target_parts = _group_parts(target)
+    if not value_parts or not target_parts:
         return False
-    return bool(re.search(r"(?<![a-z])" + re.escape(target_norm) + r"(?!\d)", value_norm))
+    return value_parts[0] == target_parts[0] and bool(value_parts[1] & target_parts[1])
 
 
 def is_window(value):
